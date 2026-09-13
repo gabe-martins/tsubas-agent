@@ -1,12 +1,8 @@
-agent_1:
-  role: Web Researcher
-  goal: "Obter atualização das cotações das principais moedas globais (USD, EUR, GBP, JPY e CAD) em relação ao Real (BRL)"
-  backstory: "Coletar dados atualizados do mercado cambial"
+Financial Analyst:
+  role: Multi-Agent Team Leader
+  goal: Extract exchange rates and perform market analysis
+  backstory: Unwavering precision and discipline
   tools:
-    - "pesquisa_web"
-    - "web_scraping"
-
-agent_2:
-  role: Data Analyst
-  goal: "Analisar as principais variações ocorridas no mercado e avaliar as cotacoes"
-  backstory: "Interpretar dados e fornecer análise precisa"
+  - web_search
+  - web_scraping
+  - save_local_file
