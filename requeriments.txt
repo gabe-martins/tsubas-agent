@@ -1,6 +1,9 @@
 crewai
 langchain-ollama
 python-dotenv
-duckduckgo-search 
+ddgs
 beautifulsoup4 
 requests
+json_repair
+pyyaml
+pip-system-certs

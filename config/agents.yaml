@@ -1,12 +1,7 @@
 agent_1:
-  role: Web Researcher
-  goal: "Obter atualização das cotações das principais moedas globais (USD, EUR, GBP, JPY e CAD) em relação ao Real (BRL)"
-  backstory: "Coletar dados atualizados do mercado cambial"
+  role: Researcher
+  goal: Pesquisar o preço do Playstation 5 em 2026
+  backstory: Encontrar o preço atualizado do Playstation 5 para o ano de 2026
   tools:
-    - "pesquisa_web"
-    - "web_scraping"
-
-agent_2:
-  role: Data Analyst
-  goal: "Analisar as principais variações ocorridas no mercado e avaliar as cotacoes"
-  backstory: "Interpretar dados e fornecer análise precisa"
+  - web_search
+  - save_local_file
