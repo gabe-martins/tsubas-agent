@@ -1,6 +1,8 @@
 import os
 import re
+import sys
 import yaml
+import argparse
 from dotenv import load_dotenv
 from crewai import LLM, Agent, Crew, Process, Task
 
@@ -8,7 +10,7 @@ load_dotenv()
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 MODEL_ROUTER = os.getenv("MODEL_REVIEWER", "llama3.1:8b")
-MODEL_WORKER = os.getenv("MODEL_CODER", "qwen2.5-coder:7b")
+MODEL_WORKER = os.getenv("MODEL_WORKER", os.getenv("MODEL_CODER", "qwen2.5-coder:7b"))
 
 # Conexões LLM
 llm_arquitetura = LLM(model=f"ollama/{MODEL_ROUTER}", base_url=OLLAMA_BASE_URL)
@@ -136,17 +138,54 @@ def executar_equipe_dinamica():
     return equipe.kickoff()
 
 # ------------------------------------------------------------------
+# CLI: LEITURA DO OBJETIVO
+# ------------------------------------------------------------------
+def build_arg_parser() -> argparse.ArgumentParser:
+    """CLI mínima para passar o objetivo sem editar o código-fonte."""
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="Tsubas Agent (versão mínima) - gera e executa uma equipe CrewAI dinâmica a partir de um objetivo.",
+    )
+    parser.add_argument("objective", nargs="*", help='Objetivo em linguagem natural, ex: python main.py "seu objetivo aqui".')
+    parser.add_argument("-f", "--file", help="Lê o objetivo de um arquivo de texto em vez da linha de comando.")
+    parser.add_argument("--reuse-config", action="store_true",
+                         help="Pula a fase de design e reaproveita config/agents.yaml e config/tasks.yaml existentes.")
+    return parser
+
+
+def resolve_objective(args: argparse.Namespace, fallback: str) -> str:
+    """Resolve o objetivo a partir de --file, argumentos posicionais, stdin ou um valor padrão, nessa ordem."""
+    if args.file:
+        with open(args.file, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    if args.objective:
+        return " ".join(args.objective).strip()
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        if piped:
+            return piped
+    return fallback
+
+
+# ------------------------------------------------------------------
 # EXECUÇÃO DO FLUXO COMPLETO
 # ------------------------------------------------------------------
 if __name__ == "__main__":
+    cli_args = build_arg_parser().parse_args()
+
     # Altere este prompt para testar a criação de equipes totalmente diferentes
     objetivo_desejado = (
         "Criar um script Python que faça web scraping de cotações de moedas "
         "e salve em um arquivo JSON, formatado e com tratamento de erros."
     )
+    objetivo_desejado = resolve_objective(cli_args, objetivo_desejado)
 
-    # 1. Cria a estrutura procedural de agentes
-    gerar_configuracoes_equipe(objetivo_desejado)
+    has_existing_config = os.path.exists("config/agents.yaml") and os.path.exists("config/tasks.yaml")
+    if cli_args.reuse_config and has_existing_config:
+        print("♻️  Reaproveitando config/agents.yaml e config/tasks.yaml existentes (fase de design pulada).")
+    else:
+        # 1. Cria a estrutura procedural de agentes
+        gerar_configuracoes_equipe(objetivo_desejado)
 
     # 2. Executa a equipe gerada
     resultado = executar_equipe_dinamica()
