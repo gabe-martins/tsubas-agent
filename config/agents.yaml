@@ -1,8 +1,7 @@
-Financial Analyst:
-  role: Multi-Agent Team Leader
-  goal: Extract exchange rates and perform market analysis
-  backstory: Unwavering precision and discipline
+agent_1:
+  role: Researcher
+  goal: Pesquisar o preço do Playstation 5 em 2026
+  backstory: Encontrar o preço atualizado do Playstation 5 para o ano de 2026
   tools:
   - web_search
-  - web_scraping
   - save_local_file

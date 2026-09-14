@@ -1,12 +1,6 @@
-RateSearchTask:
-  description: Search for the latest exchange rates for USD, EUR, GBP, JPY, and CAD
-    against the Brazilian Real (BRL) on the reliable Xe.com exchange rates webpage.
-  expected_output: Exchange rates in JSON format
-  agent: Financial Analyst
-  output_file: output/xe_exchange_rates.json
-MarketAnalysisTask:
-  description: Extract exchange rate insights using web scraping to analyze market
-    trends and create a concise market analysis in JSON format.
-  expected_output: Market analysis in JSON format
-  agent: Financial Analyst
-  output_file: output/market_analysis.json
+task_1:
+  description: Pesquisar o preço do Playstation 5 em 2026 utilizando a ferramenta
+    web_search
+  expected_output: Preço atualizado do Playstation 5 em 2026
+  agent: agent_1
+  output_file: output/preco_playstation_5_2026.json

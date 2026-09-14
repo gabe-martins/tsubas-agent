@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from crewai import LLM, Agent, Crew, Process, Task
 from crewai.tools import tool
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from json_repair import repair_json
 
 # Ensure UTF-8 output on Windows consoles to prevent UnicodeEncodeError
@@ -107,23 +107,71 @@ def clean_and_repair_json(raw_text: str):
     return None
 
 # ------------------------------------------------------------------
+# TOOL RELIABILITY TRACKING & ANTI-HALLUCINATION GUARDRAILS
+# ------------------------------------------------------------------
+# Some backends are blocked by TLS-inspecting proxies on certain networks; trying several
+# in sequence lets the tool keep working even when the first choices are unreachable.
+SEARCH_BACKENDS = ["google", "bing", "duckduckgo", "brave", "yahoo", "mojeek"]
+
+TOOL_STATS = {"search_success": 0, "search_fail": 0, "scrape_success": 0, "scrape_fail": 0}
+
+def reset_tool_stats():
+    """Resets tool call counters at the start of each objective run."""
+    for key in TOOL_STATS:
+        TOOL_STATS[key] = 0
+
+FABRICATION_MARKERS = (
+    "internal knowledge", "as of my last update", "as of my knowledge cutoff",
+    "i do not have real-time", "i don't have real-time", "i don't have access to real-time",
+    "hypothetical", "simulated data", "for demonstration purposes", "illustrative purposes",
+    "example data", "placeholder data",
+)
+
+def contains_fabrication_markers(text: str) -> bool:
+    """Heuristically detects language indicating the model fabricated data instead of using tool results."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in FABRICATION_MARKERS)
+
+INTEGRITY_CLAUSE = (
+    "\n\nINTEGRITY RULE: Only report information actually returned by your tools. If a tool fails or "
+    "returns no data, do NOT invent, guess, or rely on pre-trained/internal knowledge as if it were live data. "
+    "In that case, explicitly state in your output that the data could not be retrieved and why."
+)
+
+# ------------------------------------------------------------------
 # AGENT TOOLS & SKILLS DEFINITION
 # ------------------------------------------------------------------
 @tool("Web Search Tool")
 def web_search(query: str) -> str:
-    """Searches up-to-date information on the web using DuckDuckGo.
+    """Searches up-to-date information on the web, trying several search engine backends in sequence.
     Receives a search query string and returns top results with title, URL, and snippet summary.
     """
-    try:
-        if isinstance(query, dict):
-            query = query.get("query", query.get("description", str(query)))
-        results = []
-        with DDGS() as ddgs:
-            for r in ddgs.text(str(query).strip(), max_results=5):
-                results.append(f"Title: {r.get('title', '')}\nURL: {r.get('href', '')}\nSnippet: {r.get('body', '')}\n")
-        return "\n".join(results) if results else "No results found. Proceed using your knowledge and synthesize the response."
-    except Exception as e:
-        return f"Web search notice: {str(e)}. Proceed with synthesis."
+    if isinstance(query, dict):
+        query = query.get("query", query.get("description", str(query)))
+    query = str(query).strip()
+
+    last_error = ""
+    for backend in SEARCH_BACKENDS:
+        try:
+            results = []
+            with DDGS(timeout=10) as ddgs:
+                for r in ddgs.text(query, max_results=5, backend=backend):
+                    results.append(f"Title: {r.get('title', '')}\nURL: {r.get('href', '')}\nSnippet: {r.get('body', '')}\n")
+            if results:
+                TOOL_STATS["search_success"] += 1
+                return "\n".join(results)
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    TOOL_STATS["search_fail"] += 1
+    return (
+        f"Web search failed on all backends ({', '.join(SEARCH_BACKENDS)}). Last error: {last_error[:200]}. "
+        "Do NOT invent or guess data to compensate. If no data can be retrieved, state clearly in your output "
+        "that live data was unavailable and explain why."
+    )
 
 @tool("Web Scraping Tool")
 def web_scraping(url: str) -> str:
@@ -140,9 +188,14 @@ def web_scraping(url: str) -> str:
             tag.extract()
             
         clean_text = soup.get_text(separator=' ', strip=True)
+        TOOL_STATS["scrape_success"] += 1
         return clean_text[:4000]
     except Exception as e:
-        return f"Scraping notice for URL {url}: {str(e)}"
+        TOOL_STATS["scrape_fail"] += 1
+        return (
+            f"Scraping notice for URL {url}: {str(e)}. Do NOT invent data to replace this page's content; "
+            "try a different URL or state that this source was unavailable."
+        )
 
 @tool("Save Local File Tool")
 def save_local_file(filepath: str, content: str) -> str:
@@ -283,7 +336,7 @@ def generate_team_configurations(user_prompt: str, max_attempts: int = 3):
         print(f"🔄 [Architectural Loop] Attempt {attempt}/{max_attempts}...")
 
         meta_prompt = f"""
-Analyze the following objective and design a lean, highly effective multi-agent team in YAML to achieve it directly.
+Analyze the following objective and design a lean, highly effective multi-agent team in JSON to achieve it directly.
 
 Objective: "{user_prompt}"
 
@@ -296,70 +349,81 @@ RULES:
 1. Design a LEAN team: Keep it to 1 or 2 focused agents and 1 or 2 clear sequential tasks maximum. Avoid creating unnecessary micro-tasks.
 2. If the objective requires generating or saving a file (or report, data, code, JSON, etc.):
    - Assign the 'save_local_file' tool to the agent responsible for producing the deliverable.
-   - Set 'output_file: "output/<filename.ext>"' on the task using an appropriate filename and extension based on the user's request.
+   - Set "output_file": "output/<filename.ext>" on the task using an appropriate filename and extension based on the user's request.
    - In that task's description, explicitly instruct the agent to produce the complete deliverable and save it to 'output/<filename.ext>'.
-3. If no file saving is requested, do not set 'output_file'.
+3. If no file saving is requested, do not set "output_file".
 
-{f"ATTENTION: Your previous attempt failed with error: {error_feedback}. Fix the YAML syntax strictly!" if error_feedback else ""}
+{f"ATTENTION: Your previous attempt failed with error: {error_feedback}. Fix the JSON strictly!" if error_feedback else ""}
 
-Generate EXACTLY two valid YAML structures separated by the line '---'. Do not add extra markdown wrappers beyond what is required.
-
-Structure 1 (agents):
-agent_name:
-  role: "..."
-  goal: "..."
-  backstory: "..."
-  tools: ["web_search", "save_local_file"] # Assign only necessary tools
-
-Structure 2 (tasks):
-task_name:
-  description: "..."
-  expected_output: "..."
-  agent: "agent_name"
-  output_file: "output/<filename.ext>" # Include if task produces a file
+Respond with ONLY a single valid JSON object (no prose, no markdown fences, no headers/titles) in EXACTLY this shape:
+{{
+  "agents": {{
+    "agent_1": {{
+      "role": "...",
+      "goal": "...",
+      "backstory": "...",
+      "tools": ["web_search", "save_local_file"]
+    }}
+  }},
+  "tasks": {{
+    "task_1": {{
+      "description": "...",
+      "expected_output": "...",
+      "agent": "agent_1",
+      "output_file": "output/<filename.ext>"
+    }}
+  }}
+}}
 """
 
         design_task = Task(
             description=meta_prompt,
-            expected_output="Two valid YAML structures separated strictly by '---'",
+            expected_output="A single valid JSON object with 'agents' and 'tasks' keys, no prose or markdown fences",
             agent=architect
         )
 
         meta_crew = Crew(agents=[architect], tasks=[design_task], verbose=False)
-        yaml_response = str(meta_crew.kickoff())
+        raw_response = str(meta_crew.kickoff())
 
-        # Clean LLM response text
-        clean_response = re.sub(r'```(?:yaml)?', '', yaml_response).strip().rstrip('`')
-        parts = [p.strip() for p in clean_response.split('---') if p.strip()]
+        # JSON tolerates small-model formatting mistakes far better than indentation-sensitive YAML,
+        # and we can reuse the existing repair_json-based recovery helper below.
+        parsed = clean_and_repair_json(raw_response)
 
-        if len(parts) >= 2:
-            try:
-                dict1 = yaml.safe_load(parts[0]) or {}
-                dict2 = yaml.safe_load(parts[1]) or {}
-                all_items = {}
-                if isinstance(dict1, dict):
-                    all_items.update(dict1)
-                if isinstance(dict2, dict):
-                    all_items.update(dict2)
+        try:
+            if not isinstance(parsed, dict):
+                raise ValueError("Response was not a JSON object.")
 
-                agents_dict = {k: v for k, v in all_items.items() if isinstance(v, dict) and ("role" in v or "goal" in v)}
-                tasks_dict = {k: v for k, v in all_items.items() if isinstance(v, dict) and ("description" in v or "expected_output" in v or "agent" in v)}
+            agents_section = parsed.get("agents", parsed)
+            tasks_section = parsed.get("tasks", parsed)
+            all_items = {}
+            if isinstance(agents_section, dict):
+                all_items.update(agents_section)
+            if isinstance(tasks_section, dict):
+                all_items.update(tasks_section)
+            if not all_items and isinstance(parsed, dict):
+                all_items.update(parsed)
 
-                if agents_dict and tasks_dict:
-                    with open("config/agents.yaml", "w", encoding="utf-8") as f:
-                        yaml.dump(agents_dict, f, allow_unicode=True, sort_keys=False)
-                    with open("config/tasks.yaml", "w", encoding="utf-8") as f:
-                        yaml.dump(tasks_dict, f, allow_unicode=True, sort_keys=False)
-                    print("✅ Files 'config/agents.yaml' and 'config/tasks.yaml' validated and saved!")
-                    return
-                else:
-                    error_feedback = "YAML did not contain distinct agent and task definitions."
-            except Exception as e:
-                error_feedback = f"YAML syntax error: {str(e)}"
-        else:
-            error_feedback = "Could not find the '---' separator between agent and task YAML blocks."
+            agents_dict = {k: v for k, v in all_items.items() if isinstance(v, dict) and ("role" in v or "goal" in v)}
+            tasks_dict = {k: v for k, v in all_items.items() if isinstance(v, dict) and ("description" in v or "expected_output" in v or "agent" in v)}
 
-    raise RuntimeError("❌ Failed configuration generation loop after reaching maximum retry limit.")
+            if agents_dict and tasks_dict:
+                with open("config/agents.yaml", "w", encoding="utf-8") as f:
+                    yaml.dump(agents_dict, f, allow_unicode=True, sort_keys=False)
+                with open("config/tasks.yaml", "w", encoding="utf-8") as f:
+                    yaml.dump(tasks_dict, f, allow_unicode=True, sort_keys=False)
+                print("✅ Files 'config/agents.yaml' and 'config/tasks.yaml' validated and saved!")
+                return
+            else:
+                error_feedback = "JSON did not contain distinct agent and task definitions."
+        except Exception as e:
+            error_feedback = f"JSON parsing error: {str(e)}"
+
+        print(f"   \u26a0\ufe0f Attempt {attempt} rejected: {error_feedback}")
+
+    raise RuntimeError(
+        "\u274c Failed configuration generation loop after reaching maximum retry limit.\n"
+        f"Last error: {error_feedback}\nLast raw response:\n{raw_response[:1500]}"
+    )
 
 # ------------------------------------------------------------------
 # PHASE 2: DYNAMIC EXECUTION WITH REFINEMENT & VERIFIER LOOP
@@ -367,6 +431,7 @@ task_name:
 def execute_dynamic_team_with_loop(original_objective: str, max_quality_loops: int = 2):
     """Instantiates the dynamic crew and executes it within a Quality Verification & Feedback Loop."""
     print("🚀 Instantiating and executing the dynamic work crew...")
+    reset_tool_stats()
 
     with open("config/agents.yaml", "r", encoding="utf-8") as f:
         agents_data = yaml.safe_load(f) or {}
@@ -401,9 +466,9 @@ def execute_dynamic_team_with_loop(original_objective: str, max_quality_loops: i
                     agent_tools.append(TOOL_MAP[tool_name])
 
         agent = Agent(
-            role=specs.get("role", "Execution Agent"),
-            goal=specs.get("goal", "Perform assigned task"),
-            backstory=specs.get("backstory", "Task execution specialist"),
+            role=specs.get("role") or "Execution Agent",
+            goal=specs.get("goal") or "Perform assigned task",
+            backstory=specs.get("backstory") or "Task execution specialist",
             tools=agent_tools,
             llm=llm_execution,
             max_iter=8,
@@ -434,7 +499,7 @@ def execute_dynamic_team_with_loop(original_objective: str, max_quality_loops: i
             exp_out = json.dumps(exp_out, ensure_ascii=False)
 
         task_kwargs = {
-            "description": specs.get("description", ""),
+            "description": specs.get("description", "") + INTEGRITY_CLAUSE,
             "expected_output": str(exp_out),
             "agent": responsible_agent,
         }
@@ -481,7 +546,44 @@ def execute_dynamic_team_with_loop(original_objective: str, max_quality_loops: i
                     saved_files.append(f"- {fname} ({os.path.getsize(fpath)} bytes)")
         files_summary = "\n".join(saved_files) if saved_files else "None"
 
-        audit_description = f"""
+        # Deterministic guardrail: catch fabricated/hallucinated data, fully failed tool usage,
+        # or a malformed deliverable, before trusting a (less reliable) local LLM's self-reported judgment.
+        stats_snapshot = dict(TOOL_STATS)
+        total_tool_calls = sum(stats_snapshot.values())
+        zero_successful_tools = (stats_snapshot["search_success"] + stats_snapshot["scrape_success"]) == 0
+        any_tool_failures = (stats_snapshot["search_fail"] + stats_snapshot["scrape_fail"]) > 0
+        fabricated = contains_fabrication_markers(execution_result)
+
+        invalid_json_file = False
+        if target_output_file.endswith(".json") and os.path.exists(target_output_file):
+            try:
+                with open(target_output_file, "r", encoding="utf-8") as f:
+                    json.load(f)
+            except Exception:
+                invalid_json_file = True
+
+        if fabricated or (total_tool_calls > 0 and zero_successful_tools and any_tool_failures):
+            verdict = (
+                "STATUS: REJECTED\n"
+                "REASON: Deterministic guardrail triggered - the output contains language indicating "
+                f"fabricated/non-live data (detected={fabricated}), or no tool call succeeded "
+                f"(stats={stats_snapshot}).\n"
+                "REWORK_INSTRUCTION: Retry using the available tools with different queries or sources. "
+                "If tools keep failing, explicitly disclose in the deliverable that live data was unavailable "
+                "instead of presenting invented figures as real."
+            )
+            print(f"🛑 [Guardrail] Auto-rejected before LLM audit. Tool stats: {stats_snapshot}")
+        elif invalid_json_file:
+            verdict = (
+                "STATUS: REJECTED\n"
+                f"REASON: Deterministic guardrail triggered - '{target_output_file}' does not contain valid JSON "
+                "even though a .json deliverable was required.\n"
+                f"REWORK_INSTRUCTION: Use the 'save_local_file' tool to write a single valid JSON object/array "
+                f"(no prose, no markdown fences) to '{target_output_file}'."
+            )
+            print(f"🛑 [Guardrail] Auto-rejected before LLM audit: '{target_output_file}' is not valid JSON.")
+        else:
+            audit_description = f"""
 Original Objective: "{original_objective}"
 
 Delivered Files in 'output/' Directory:
@@ -490,6 +592,8 @@ Delivered Files in 'output/' Directory:
 Target Output File:
 '{target_output_file}'
 
+Tool Call Statistics So Far: {stats_snapshot}
+
 Current Execution Result:
 "{execution_result[:2500]}"
 
@@ -497,22 +601,24 @@ Verify if:
 1. The objective requirements were fulfilled.
 2. If file generation was requested, verify that the expected file exists in 'output/' and has meaningful content.
 3. The content is well-structured and free of major defects or placeholder errors.
+4. The data appears to genuinely come from tool calls (not invented). If the tool statistics show zero 
+successful search/scrape calls yet the result presents specific real-world figures as fact, REJECT it.
 
 Respond strictly in the format:
 STATUS: [APPROVED or REJECTED]
 REASON: [Brief explanation]
 REWORK_INSTRUCTION: [Clear instructions for adjustment if REJECTED]
 """
-        audit_task = Task(
-            description=audit_description,
-            expected_output="Formatted strictly with STATUS, REASON, and REWORK_INSTRUCTION",
-            agent=inspector_agent
-        )
+            audit_task = Task(
+                description=audit_description,
+                expected_output="Formatted strictly with STATUS, REASON, and REWORK_INSTRUCTION",
+                agent=inspector_agent
+            )
 
-        audit_crew = Crew(agents=[inspector_agent], tasks=[audit_task], verbose=False)
-        verdict = str(audit_crew.kickoff())
+            audit_crew = Crew(agents=[inspector_agent], tasks=[audit_task], verbose=False)
+            verdict = str(audit_crew.kickoff())
 
-        if "STATUS: APPROVED" in verdict:
+        if re.search(r"STATUS:\s*APPROVED", verdict, re.IGNORECASE):
             print("✅ Output APPROVED by Quality Inspector!")
             break
         else:
@@ -524,7 +630,10 @@ REWORK_INSTRUCTION: [Clear instructions for adjustment if REJECTED]
                 description=(
                     f"Address all issues flagged by the inspector:\n{feedback_loop}\n"
                     f"Original Goal: {original_objective}\n"
+                    f"Tool call statistics so far: {stats_snapshot}\n"
+                    "If searches/scrapes keep failing, try substantially different queries or URLs. "
                     f"Save the final deliverable using 'save_local_file' into '{target_output_file}'."
+                    + INTEGRITY_CLAUSE
                 ),
                 expected_output=f"Corrected result saved into '{target_output_file}'.",
                 agent=agents_list[-1],
@@ -550,9 +659,7 @@ REWORK_INSTRUCTION: [Clear instructions for adjustment if REJECTED]
 if __name__ == "__main__":
     # Generalist objective: can be changed to ANY request (research, reports, code, data, JSON, etc.)
     desired_objective = (
-        "Search current exchange rates for global currencies (USD, EUR, GBP, JPY, and CAD) against Brazilian Real (BRL). "
-        "Get the latest rates and write a succinct market analysis. "
-        "Format all rates and analysis into a clean JSON structure and save the file inside the 'output' directory."
+        "Pesquise o preco do playstation 5 no ano de 2026 e monte um historio temporal entre janeiro e agosto."
     )
 
     # Allow custom prompt via command line argument: python main_script.py "seu prompt aqui"
